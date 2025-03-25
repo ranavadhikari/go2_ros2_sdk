@@ -293,6 +293,32 @@ class RobotBaseNode(Node):
     def joy_cb(self, msg):
         self.joy_state = msg
 
+        deadzone = 0.05
+
+        def apply_deadzone(value):
+            return 0.0 if abs(value) < deadzone else round(value, 2)
+
+        # Axis 0 & 1 → X movement
+        x = apply_deadzone(msg.axes[1]) + apply_deadzone(msg.axes[0]) if len(msg.axes) > 1 else 0.0
+        # Axis 3 & 4 → Y movement
+        y = apply_deadzone(msg.axes[3]) + apply_deadzone(msg.axes[4]) if len(msg.axes) > 4 else 0.0
+        # Axis 2 & 5 → Z rotation
+        z = apply_deadzone(msg.axes[5]) - apply_deadzone(msg.axes[2]) if len(msg.axes) > 5 else 0.0
+
+        # Movement scaling
+        speed_x = round(x * 0.5, 2)
+        speed_y = round(y * 0.3, 2)
+        speed_z = round(z * 0.8, 2)
+
+        # Decide if robot should move or stop
+        if any([speed_x, speed_y, speed_z]):
+            self.robot_cmd_vel["0"] = gen_mov_command(speed_x, speed_y, speed_z)
+        else:
+            self.robot_cmd_vel["0"] = gen_command(ROBOT_CMD["StopMove"])  # Send stop when axes are idle
+
+
+
+
     def publish_body_poss_cyclonedds(self, msg):
         odom_trans = TransformStamped()
         odom_trans.header.stamp = self.get_clock().now().to_msg()
@@ -338,24 +364,110 @@ class RobotBaseNode(Node):
         self.go2_lidar_pub[0].publish(msg)
 
     def joy_cmd(self, robot_num):
-        if robot_num in self.conn and robot_num in self.robot_cmd_vel and self.robot_cmd_vel[
-                robot_num] is not None:
-            self.get_logger().info("Move")
-            self.conn[robot_num].data_channel.send(
-                self.robot_cmd_vel[robot_num])
-            self.robot_cmd_vel[robot_num] = None
+        try:
+            # --- Movement ---
+            if (robot_num in self.conn and
+                robot_num in self.robot_cmd_vel and
+                self.robot_cmd_vel[robot_num] is not None):
 
-        if robot_num in self.conn and self.joy_state.buttons and self.joy_state.buttons[1]:
-            self.get_logger().info("Stand down")
-            stand_down_cmd = gen_command(ROBOT_CMD["StandDown"])
-            self.conn[robot_num].data_channel.send(stand_down_cmd)
+                cmd = self.robot_cmd_vel[robot_num]
 
-        if robot_num in self.conn and self.joy_state.buttons and self.joy_state.buttons[0]:
-            self.get_logger().info("Stand up")
-            stand_up_cmd = gen_command(ROBOT_CMD["StandUp"])
-            self.conn[robot_num].data_channel.send(stand_up_cmd)
-            move_cmd = gen_command(ROBOT_CMD['BalanceStand'])
-            self.conn[robot_num].data_channel.send(move_cmd)
+                # Only log if it's actual movement, not StopMove
+                if isinstance(cmd, dict) and cmd.get("cmdId") != ROBOT_CMD["StopMove"]:
+                    self.get_logger().info("Move")
+
+                self.conn[robot_num].data_channel.send(cmd)
+                self.robot_cmd_vel[robot_num] = None
+
+            # --- Stand Up (A) ---
+            if self.joy_state.buttons and self.joy_state.buttons[0]:
+                self.get_logger().info("Stand up")
+                stand_up = gen_command(ROBOT_CMD["StandUp"])
+                balance = gen_command(ROBOT_CMD["BalanceStand"])
+                self.conn[robot_num].data_channel.send(stand_up)
+                self.conn[robot_num].data_channel.send(balance)
+
+            # --- Stand Down (B) ---
+            if self.joy_state.buttons and self.joy_state.buttons[1]:
+                self.get_logger().info("Stand down")
+                down_cmd = gen_command(ROBOT_CMD["StandDown"])
+                self.conn[robot_num].data_channel.send(down_cmd)
+
+            # --- Sit (X) ---
+            if self.joy_state.buttons and self.joy_state.buttons[2]:
+                self.get_logger().info("Sit")
+                sit_cmd = gen_command(ROBOT_CMD["Sit"])
+                self.conn[robot_num].data_channel.send(sit_cmd)
+
+            # # --- Eco Mode Toggle (Y - Button 3) ---
+            # if len(self.joy_state.buttons) > 3 and self.joy_state.buttons[3]:
+            #     if not hasattr(self, '_eco_last_state') or not self._eco_last_state:
+            #         self._eco_last_state = True
+            #         if not hasattr(self, 'eco_mode_enabled'):
+            #             self.eco_mode_enabled = False
+            #         self.eco_mode_enabled = not self.eco_mode_enabled
+
+            #         if self.eco_mode_enabled:
+            #             self.get_logger().info("Eco Mode ENABLED")
+            #             eco_cmd = gen_command(ROBOT_CMD["EconomicGait"])
+            #             self.conn[robot_num].data_channel.send(eco_cmd)
+            #         else:
+            #             self.get_logger().info("Eco Mode DISABLED — Switching to Continuous Gait")
+            #             normal_cmd = gen_command(ROBOT_CMD["ContinuousGait"])
+            #             self.conn[robot_num].data_channel.send(normal_cmd)
+            # else:
+            #     self._eco_last_state = False
+
+            # --- Shutdown (B + X) ---
+            if self.joy_state.buttons and self.joy_state.buttons[1] and self.joy_state.buttons[2]:
+                self.get_logger().warn("StopMove")
+                stop_cmd = gen_command(ROBOT_CMD["StopMove"])
+                self.conn[robot_num].data_channel.send(stop_cmd)
+
+            # --- Speed Up (LB - Button 5) ---
+            if len(self.joy_state.buttons) > 5 and self.joy_state.buttons[4]:
+                if not self._speed_last_state[0]:
+                    self._speed_last_state[0] = True
+                    self.speed_scale = min(2.0, round(self.speed_scale + 0.1, 2))
+                    self.get_logger().info(f"Speed increased: x{self.speed_scale}")
+            else:
+                self._speed_last_state[0] = False
+
+            # --- Slow Down (RB - Button 6) ---
+            if len(self.joy_state.buttons) > 6 and self.joy_state.buttons[5]:
+                if not self._speed_last_state[1]:
+                    self._speed_last_state[1] = True
+                    self.speed_scale = max(0.2, round(self.speed_scale - 0.1, 2))
+                    self.get_logger().info(f"Speed decreased: x{self.speed_scale}")
+            else:
+                self._speed_last_state[1] = False
+
+            # # --- Toggle Object Avoidance (LB - Button 4) ---
+            # if len(self.joy_state.buttons) > 4 and self.joy_state.buttons[4]:
+            #     if not hasattr(self, '_oa_last_state') or not self._oa_last_state:
+            #         self._oa_last_state = True
+            #         if not hasattr(self, 'object_avoidance_enabled'):
+            #             self.object_avoidance_enabled = False
+            #         self.object_avoidance_enabled = not self.object_avoidance_enabled
+
+            #         self.get_logger().info(
+            #             f"Object Avoidance: {'ENABLED' if self.object_avoidance_enabled else 'DISABLED'}")
+
+            #         payload = {
+            #             "type": "request",
+            #             "topic": RTC_TOPIC["OBSTACLES_AVOID"],
+            #             "data": {
+            #                 "enabled": self.object_avoidance_enabled
+            #             }
+            #         }
+            #         self.conn[robot_num].data_channel.send(json.dumps(payload))
+            # else:
+            #     self._oa_last_state = False
+
+        except Exception as e:
+            self.get_logger().error(f"Error in joy_cmd(): {e}")
+
+
 
     def on_validated(self, robot_num):
         if robot_num in self.conn:
