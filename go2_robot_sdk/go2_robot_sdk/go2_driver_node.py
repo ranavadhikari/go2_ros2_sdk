@@ -250,7 +250,10 @@ class RobotBaseNode(Node):
                 '/utlidar/cloud',
                 self.publish_lidar_cyclonedds,
                 qos_profile)
-
+        
+        self.speed_level = 1
+        self._speed_last_state = [False, False]
+        
         self.timer = self.create_timer(0.1, self.timer_callback)
         self.timer_lidar = self.create_timer(0.5, self.timer_callback_lidar)
 
@@ -305,16 +308,17 @@ class RobotBaseNode(Node):
         # Axis 2 & 5 → Z rotation
         z = apply_deadzone(msg.axes[5]) - apply_deadzone(msg.axes[2]) if len(msg.axes) > 5 else 0.0
 
-        # Movement scaling
-        speed_x = round(x * 0.5, 2)
-        speed_y = round(y * 0.3, 2)
-        speed_z = round(z * 0.8, 2)
+        # Set scaling factor based on speed level (1, 2, 3)
+        scale_factor = {1: 0.3, 2: 0.6, 3: 1.0}.get(self.speed_level, 0.3)
 
-        # Decide if robot should move or stop
+        speed_x = round(x * scale_factor, 2)
+        speed_y = round(y * scale_factor, 2)
+        speed_z = round(z * scale_factor, 2)
+
         if any([speed_x, speed_y, speed_z]):
             self.robot_cmd_vel["0"] = gen_mov_command(speed_x, speed_y, speed_z)
         else:
-            self.robot_cmd_vel["0"] = gen_command(ROBOT_CMD["StopMove"])  # Send stop when axes are idle
+            self.robot_cmd_vel["0"] = gen_command(ROBOT_CMD["StopMove"])
 
 
 
@@ -398,6 +402,11 @@ class RobotBaseNode(Node):
                 self.get_logger().info("Sit")
                 sit_cmd = gen_command(ROBOT_CMD["Sit"])
                 self.conn[robot_num].data_channel.send(sit_cmd)
+            # Recovery Mode (Button Y)
+            if self.joy_state.buttons and self.joy_state.buttons[3]:
+                self.get_logger().info("Recovery mode")
+                recovery_cmd = gen_command(ROBOT_CMD["RecoveryStand"])
+                self.conn[robot_num].data_channel.send(recovery_cmd)
 
             # # --- Eco Mode Toggle (Y - Button 3) ---
             # if len(self.joy_state.buttons) > 3 and self.joy_state.buttons[3]:
@@ -424,23 +433,36 @@ class RobotBaseNode(Node):
                 stop_cmd = gen_command(ROBOT_CMD["StopMove"])
                 self.conn[robot_num].data_channel.send(stop_cmd)
 
-            # --- Speed Up (LB - Button 5) ---
-            if len(self.joy_state.buttons) > 5 and self.joy_state.buttons[4]:
+            # Initialize defaults (you can also set this in __init__)
+            if not hasattr(self, 'speed_level'):
+                self.speed_level = 1
+            if not hasattr(self, '_speed_last_state'):
+                self._speed_last_state = [False, False]
+
+            # Speed Up (LB - Button 4)
+            if len(self.joy_state.buttons) > 4 and self.joy_state.buttons[4]:
                 if not self._speed_last_state[0]:
                     self._speed_last_state[0] = True
-                    self.speed_scale = min(2.0, round(self.speed_scale + 0.1, 2))
-                    self.get_logger().info(f"Speed increased: x{self.speed_scale}")
+                    if self.speed_level < 3:
+                        self.speed_level += 1
+                        cmd = gen_command(ROBOT_CMD["SpeedLevel"], {"level": self.speed_level})
+                        self.conn[robot_num].data_channel.send(cmd)
+                        self.get_logger().info(f"Speed Level increased to {self.speed_level}")
             else:
                 self._speed_last_state[0] = False
 
-            # --- Slow Down (RB - Button 6) ---
-            if len(self.joy_state.buttons) > 6 and self.joy_state.buttons[5]:
+            # Speed Down (RB - Button 5)
+            if len(self.joy_state.buttons) > 5 and self.joy_state.buttons[5]:
                 if not self._speed_last_state[1]:
                     self._speed_last_state[1] = True
-                    self.speed_scale = max(0.2, round(self.speed_scale - 0.1, 2))
-                    self.get_logger().info(f"Speed decreased: x{self.speed_scale}")
+                    if self.speed_level > 1:
+                        self.speed_level -= 1
+                        cmd = gen_command(ROBOT_CMD["SpeedLevel"], {"level": self.speed_level})
+                        self.conn[robot_num].data_channel.send(cmd)
+                        self.get_logger().info(f"Speed Level decreased to {self.speed_level}")
             else:
                 self._speed_last_state[1] = False
+
 
             # # --- Toggle Object Avoidance (LB - Button 4) ---
             # if len(self.joy_state.buttons) > 4 and self.joy_state.buttons[4]:
