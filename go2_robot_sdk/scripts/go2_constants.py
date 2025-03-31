@@ -53,6 +53,7 @@ ROBOT_CMD = {
     "GetFootRaiseHeight": 1025,
     "GetSpeedLevel": 1026,
     "SwitchJoystick": 1027,
+    "BackFlip": 1044,
     "Pose": 1028,
     "Scrape": 1029,
     "FrontFlip": 1030,
@@ -106,6 +107,7 @@ RTC_TOPIC = {
     "ARM_FEEDBACK": "rt/arm_Feedback",
     "AUDIO_HUB_REQ": "rt/api/audiohub/request",
     "AUDIO_HUB_PLAY_STATE": "rt/audiohub/player/state",
+    "MOTION_SWITCHER": "rt/api/motion_switcher/request"
 }
 
 DATA_CHANNEL_TYPE = {

@@ -47,7 +47,7 @@ from rclpy.qos_overriding_options import QoSOverridingOptions
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
 from go2_interfaces.msg import Go2State, IMU
-from unitree_go.msg import LowState, VoxelMapCompressed, WebRtcReq
+from unitree_go.msg import LowState, VoxelMapCompressed, WebRtcReq, LowCmd
 from sensor_msgs.msg import PointCloud2, PointField, JointState, Joy
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
@@ -88,6 +88,7 @@ class RobotBaseNode(Node):
             'decode_lidar').get_parameter_value().bool_value
         self.publish_raw_voxel = self.get_parameter(
             'publish_raw_voxel').get_parameter_value().bool_value
+        
 
         self.conn_mode = "single" if (
             len(self.robot_ip_lst) == 1 and self.conn_type != "cyclonedds") else "multi"
@@ -256,6 +257,27 @@ class RobotBaseNode(Node):
         
         self.timer = self.create_timer(0.1, self.timer_callback)
         self.timer_lidar = self.create_timer(0.5, self.timer_callback_lidar)
+        
+        self.motion_modes = ["normal", "advanced", "ai"]
+        self.current_mode_index = 0
+        self.last_lb_state = 0
+
+    async def switch_motion_mode(self, robot_num, mode_name: str, sleep_time: float = 3.0):
+        self.get_logger().info(f"Switching to motion mode: {mode_name}")
+        payload = json.dumps({
+            "type": "request",
+            "topic": RTC_TOPIC["MOTION_SWITCHER"],
+            "data": {
+                "api_id": 1002,
+                "parameter": {"name": mode_name}
+            }
+        })
+        self.conn[robot_num].data_channel.send(payload)
+        await asyncio.sleep(sleep_time)
+
+
+
+
 
     def timer_callback(self):
         if self.conn_type == 'webrtc':
@@ -280,7 +302,7 @@ class RobotBaseNode(Node):
         # Allow omni-directional movement
         if x != 0.0 or y != 0.0 or z != 0.0:
             self.robot_cmd_vel[robot_num] = gen_mov_command(
-                round(x, 2), round(y, 2), round(z, 2))
+                round(x, 4), round(y, 4), round(z, 4))
 
     def webrtc_req_cb(self, msg, robot_num):
         parameter_str = msg.parameter if msg.parameter else ""
@@ -299,26 +321,148 @@ class RobotBaseNode(Node):
         deadzone = 0.05
 
         def apply_deadzone(value):
-            return 0.0 if abs(value) < deadzone else round(value, 2)
+            return 0.0 if abs(value) < deadzone else value
 
-        # Axis 0 & 1 → X movement
-        x = apply_deadzone(msg.axes[1]) + apply_deadzone(msg.axes[0]) if len(msg.axes) > 1 else 0.0
-        # Axis 3 & 4 → Y movement
-        y = apply_deadzone(msg.axes[3]) + apply_deadzone(msg.axes[4]) if len(msg.axes) > 4 else 0.0
-        # Axis 2 & 5 → Z rotation
-        z = apply_deadzone(msg.axes[5]) - apply_deadzone(msg.axes[2]) if len(msg.axes) > 5 else 0.0
+        # Axes
+        x = apply_deadzone(msg.axes[1])  # forward/backward
+        y = apply_deadzone(msg.axes[0])  # strafe
+        x2 = apply_deadzone(msg.axes[3])  # sometimes right stick
+        y2 = apply_deadzone(msg.axes[4])
+        rot_r = apply_deadzone(msg.axes[5])
+        rot_l = apply_deadzone(msg.axes[2])
 
-        # Set scaling factor based on speed level (1, 2, 3)
-        scale_factor = {1: 0.3, 2: 0.6, 3: 1.0}.get(self.speed_level, 0.3)
+        # Combined movement from both sticks
+        move_x = x + x2
+        move_y = y + y2
+        move_z = rot_r - rot_l
 
-        speed_x = round(x * scale_factor, 2)
-        speed_y = round(y * scale_factor, 2)
-        speed_z = round(z * scale_factor, 2)
+        # Normalize range if needed (to prevent max > 1.0)
+        move_x = max(-1.0, min(1.0, move_x))
+        move_y = max(-1.0, min(1.0, move_y))
+        move_z = max(-1.0, min(1.0, move_z))
 
+        # Turbo mode: RT (Button 7)
+        turbo_mode = msg.buttons[7] == 1 if len(msg.buttons) > 7 else False
+
+        # 🚀 NEW: Aggressive turbo boost and clearer scaling
+        if turbo_mode:
+            max_linear_speed = 2.5  # meters/sec
+            max_rot_speed = 4.0     # radians/sec
+            self.get_logger().info("Turbo mode: ON 🐾⚡️")
+        else:
+            # You can increase these defaults if you want faster base speed too
+            max_linear_speed = {1: 0.6, 2: 1.0, 3: 1.5}.get(self.speed_level, 0.6)
+            max_rot_speed = {1: 1.0, 2: 2.0, 3: 3.0}.get(self.speed_level, 1.0)
+
+        # Final scaled values
+        speed_x = round(move_x * max_linear_speed, 2)
+        speed_y = round(move_y * max_linear_speed, 2)
+        speed_z = round(move_z * max_rot_speed, 2)
+
+        # Set velocity command
         if any([speed_x, speed_y, speed_z]):
             self.robot_cmd_vel["0"] = gen_mov_command(speed_x, speed_y, speed_z)
         else:
             self.robot_cmd_vel["0"] = gen_command(ROBOT_CMD["StopMove"])
+
+
+
+    def joy_cmd(self, robot_num):
+        try:
+            # --- Movement ---
+            if (robot_num in self.conn and
+                robot_num in self.robot_cmd_vel and
+                self.robot_cmd_vel[robot_num] is not None):
+
+                cmd = self.robot_cmd_vel[robot_num]
+
+                # Only log if it's actual movement, not StopMove
+                if isinstance(cmd, dict) and cmd.get("cmdId") != ROBOT_CMD["StopMove"]:
+                    self.get_logger().info("Move")
+
+                self.conn[robot_num].data_channel.send(cmd)
+                self.robot_cmd_vel[robot_num] = None
+
+
+
+            # --- Stand Down (A) ---
+            if self.joy_state.buttons and self.joy_state.buttons[0]:
+                self.get_logger().info("Stand down")
+                down_cmd = gen_command(ROBOT_CMD["StandDown"])
+                self.conn[robot_num].data_channel.send(down_cmd)
+
+            # --- Stand Up (B) ---
+            if self.joy_state.buttons and self.joy_state.buttons[1]:
+                self.get_logger().info("Stand up")
+                stand_up = gen_command(ROBOT_CMD["StandUp"])
+                balance = gen_command(ROBOT_CMD["BalanceStand"])
+                self.conn[robot_num].data_channel.send(stand_up)
+                self.conn[robot_num].data_channel.send(balance)
+
+            # --- Sit (X) ---
+            if self.joy_state.buttons and self.joy_state.buttons[2]:
+                self.get_logger().info("FrontJump")
+                sit_cmd = gen_command(ROBOT_CMD["FrontJump"])
+                self.conn[robot_num].data_channel.send(sit_cmd)
+
+            # Recovery Mode (Button Y)
+            if self.joy_state.buttons and self.joy_state.buttons[3]:
+                self.get_logger().info("Recovery mode")
+                recovery_cmd = gen_command(ROBOT_CMD["RecoveryStand"])
+                self.conn[robot_num].data_channel.send(recovery_cmd)
+
+
+            # --- Cycle Motion Mode (LB - Button 4) ---
+            # --- Cycle Motion Mode (LB - Button 4) ---
+            lb_pressed = self.joy_state.buttons[4]
+            if lb_pressed and not self.last_lb_state:
+                self.current_mode_index = (self.current_mode_index + 1) % len(self.motion_modes)
+                new_mode = self.motion_modes[self.current_mode_index]
+                self.get_logger().info(f"Toggling motion mode to: {new_mode}")
+                asyncio.create_task(self.switch_motion_mode(new_mode))
+
+                # 🦿 Optional: Move rear-left leg when LB is pressed + Button Y (3)
+                if self.joy_state.buttons[3]:  # Y button
+                    self.get_logger().info("Rear-left leg special move")
+                    self.move_rear_left_leg(robot_num)
+
+            self.last_lb_state = lb_pressed
+
+
+
+            # Backflip (RB - Button 5)
+            if self.joy_state.buttons and self.joy_state.buttons[5]:
+                self.get_logger().info("StandOut")
+                recovery_cmd = gen_command(ROBOT_CMD["StandOut"])
+                self.conn[robot_num].data_channel.send(recovery_cmd)
+
+        except Exception as e:
+            self.get_logger().error(f"Error in joy_cmd(): {e}")
+
+    def move_rear_left_leg(self, robot_num):
+
+        cmd = LowCmd()
+
+        # Desired joint angles in radians
+        desired_hip_angle = 0.5     # example angle
+        desired_thigh_angle = -0.8  # example angle
+        desired_calf_angle = 1.2    # example angle
+
+        # Apply angles to RL leg motors (motor_cmd[9,10,11])
+        cmd.motor_cmd[9].q = desired_hip_angle
+        cmd.motor_cmd[10].q = desired_thigh_angle
+        cmd.motor_cmd[11].q = desired_calf_angle
+
+        for i in [9, 10, 11]:
+            cmd.motor_cmd[i].mode = 0x0A  # Position control mode
+            cmd.motor_cmd[i].kp = 40
+            cmd.motor_cmd[i].dq = 0
+            cmd.motor_cmd[i].kd = 1
+
+        # Publish to low command topic
+        self.get_logger().info("Publishing rear-left leg move to /lowcmd")
+        self.create_publisher(LowCmd, 'lowcmd', 10).publish(cmd)
+
 
 
 
@@ -366,130 +510,6 @@ class RobotBaseNode(Node):
         msg.header = Header(frame_id="robot0/radar")
         msg.header.stamp = self.get_clock().now().to_msg()
         self.go2_lidar_pub[0].publish(msg)
-
-    def joy_cmd(self, robot_num):
-        try:
-            # --- Movement ---
-            if (robot_num in self.conn and
-                robot_num in self.robot_cmd_vel and
-                self.robot_cmd_vel[robot_num] is not None):
-
-                cmd = self.robot_cmd_vel[robot_num]
-
-                # Only log if it's actual movement, not StopMove
-                if isinstance(cmd, dict) and cmd.get("cmdId") != ROBOT_CMD["StopMove"]:
-                    self.get_logger().info("Move")
-
-                self.conn[robot_num].data_channel.send(cmd)
-                self.robot_cmd_vel[robot_num] = None
-
-            # --- Stand Up (A) ---
-            if self.joy_state.buttons and self.joy_state.buttons[0]:
-                self.get_logger().info("Stand up")
-                stand_up = gen_command(ROBOT_CMD["StandUp"])
-                balance = gen_command(ROBOT_CMD["BalanceStand"])
-                self.conn[robot_num].data_channel.send(stand_up)
-                self.conn[robot_num].data_channel.send(balance)
-
-            # --- Stand Down (B) ---
-            if self.joy_state.buttons and self.joy_state.buttons[1]:
-                self.get_logger().info("Stand down")
-                down_cmd = gen_command(ROBOT_CMD["StandDown"])
-                self.conn[robot_num].data_channel.send(down_cmd)
-
-            # --- Sit (X) ---
-            if self.joy_state.buttons and self.joy_state.buttons[2]:
-                self.get_logger().info("Sit")
-                sit_cmd = gen_command(ROBOT_CMD["Sit"])
-                self.conn[robot_num].data_channel.send(sit_cmd)
-            # Recovery Mode (Button Y)
-            if self.joy_state.buttons and self.joy_state.buttons[3]:
-                self.get_logger().info("Recovery mode")
-                recovery_cmd = gen_command(ROBOT_CMD["RecoveryStand"])
-                self.conn[robot_num].data_channel.send(recovery_cmd)
-
-            # # --- Eco Mode Toggle (Y - Button 3) ---
-            # if len(self.joy_state.buttons) > 3 and self.joy_state.buttons[3]:
-            #     if not hasattr(self, '_eco_last_state') or not self._eco_last_state:
-            #         self._eco_last_state = True
-            #         if not hasattr(self, 'eco_mode_enabled'):
-            #             self.eco_mode_enabled = False
-            #         self.eco_mode_enabled = not self.eco_mode_enabled
-
-            #         if self.eco_mode_enabled:
-            #             self.get_logger().info("Eco Mode ENABLED")
-            #             eco_cmd = gen_command(ROBOT_CMD["EconomicGait"])
-            #             self.conn[robot_num].data_channel.send(eco_cmd)
-            #         else:
-            #             self.get_logger().info("Eco Mode DISABLED — Switching to Continuous Gait")
-            #             normal_cmd = gen_command(ROBOT_CMD["ContinuousGait"])
-            #             self.conn[robot_num].data_channel.send(normal_cmd)
-            # else:
-            #     self._eco_last_state = False
-
-            # --- Shutdown (B + X) ---
-            if self.joy_state.buttons and self.joy_state.buttons[1] and self.joy_state.buttons[2]:
-                self.get_logger().warn("StopMove")
-                stop_cmd = gen_command(ROBOT_CMD["StopMove"])
-                self.conn[robot_num].data_channel.send(stop_cmd)
-
-            # Initialize defaults (you can also set this in __init__)
-            if not hasattr(self, 'speed_level'):
-                self.speed_level = 1
-            if not hasattr(self, '_speed_last_state'):
-                self._speed_last_state = [False, False]
-
-            # Speed Up (LB - Button 4)
-            if len(self.joy_state.buttons) > 4 and self.joy_state.buttons[4]:
-                if not self._speed_last_state[0]:
-                    self._speed_last_state[0] = True
-                    if self.speed_level < 3:
-                        self.speed_level += 1
-                        cmd = gen_command(ROBOT_CMD["SpeedLevel"], {"level": self.speed_level})
-                        self.conn[robot_num].data_channel.send(cmd)
-                        self.get_logger().info(f"Speed Level increased to {self.speed_level}")
-            else:
-                self._speed_last_state[0] = False
-
-            # Speed Down (RB - Button 5)
-            if len(self.joy_state.buttons) > 5 and self.joy_state.buttons[5]:
-                if not self._speed_last_state[1]:
-                    self._speed_last_state[1] = True
-                    if self.speed_level > 1:
-                        self.speed_level -= 1
-                        cmd = gen_command(ROBOT_CMD["SpeedLevel"], {"level": self.speed_level})
-                        self.conn[robot_num].data_channel.send(cmd)
-                        self.get_logger().info(f"Speed Level decreased to {self.speed_level}")
-            else:
-                self._speed_last_state[1] = False
-
-
-            # # --- Toggle Object Avoidance (LB - Button 4) ---
-            # if len(self.joy_state.buttons) > 4 and self.joy_state.buttons[4]:
-            #     if not hasattr(self, '_oa_last_state') or not self._oa_last_state:
-            #         self._oa_last_state = True
-            #         if not hasattr(self, 'object_avoidance_enabled'):
-            #             self.object_avoidance_enabled = False
-            #         self.object_avoidance_enabled = not self.object_avoidance_enabled
-
-            #         self.get_logger().info(
-            #             f"Object Avoidance: {'ENABLED' if self.object_avoidance_enabled else 'DISABLED'}")
-
-            #         payload = {
-            #             "type": "request",
-            #             "topic": RTC_TOPIC["OBSTACLES_AVOID"],
-            #             "data": {
-            #                 "enabled": self.object_avoidance_enabled
-            #             }
-            #         }
-            #         self.conn[robot_num].data_channel.send(json.dumps(payload))
-            # else:
-            #     self._oa_last_state = False
-
-        except Exception as e:
-            self.get_logger().error(f"Error in joy_cmd(): {e}")
-
-
 
     def on_validated(self, robot_num):
         if robot_num in self.conn:
